@@ -1,0 +1,496 @@
+---
+title: "CTCF footprint"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(reshape2)
+library(GenomicRanges)
+library(rtracklayer)
+library(plyranges)
+library(vcfR)
+library(parallel)
+library(Rsamtools)
+library(DT)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(genomation)
+library(scales)
+library(cowplot)
+library(ggpubr)
+
+
+source("/project/spott/kevinluo/Fiber_seq/fiberhub/code/genotype_utils.R")
+
+# adapted Kevin's code to setup environment
+source("/project/spott/cshan/code/process_fiberseq_data.R")
+source("/project/spott/kevinluo/Fiber_seq/fiberhub/code/plots.R")
+
+source("/project/spott/kevinluo/Fiber_seq/code/plot_region_functions.R")
+source("/project/spott/kevinluo/Fiber_seq/code/fiber_footprint_caller.R")
+```
+
+
+
+# Kevin's guide to plot specific region of the genome with TF footprints
+https://kevinlkx.github.io/fiber-seq-analysis/plot_region_examples.html#Example_region_with_TF_footprints 
+
+```{r}
+# Sample table for LCL Fiber-seq data used in QTL analysis
+sample_table_file = "/project/spott/kevinluo/Fiber_seq/data/Fiberseq/LCL_sample_metatable_merged_samples_31samples.csv"
+sample_table <- data.table::fread(sample_table_file, header = TRUE)
+
+# Select samples of interest
+selected_sample_table <- sample_table %>% dplyr::filter(sample_name %in% c("AL48_bc2134_18505"))
+
+# FiberHMM result directory
+fiberhmm_result_dir = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged"
+
+# Vierstra motif clustering file
+motif_clustering_file = "/project/spott/kevinluo/Fiber_seq/data/motifs/Vierstra_motif_clustering/hg38.archetype_motifs.v1.0.bed.gz"
+
+# FiberHMM MACS peak directory
+peak_dir = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_peaks"
+# refined FiberHMM peak directory
+refined_peak_dir = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_peaks/refined_peaks"
+
+# Output directory with parsed results for the regions of interest
+parsed_result_dir = "/project/spott/cshan/fiber-seq/results/extract_region_result_test"
+# create the directory if it does not exist
+if (!dir.exists(parsed_result_dir)){
+  dir.create(parsed_result_dir, recursive = TRUE)
+}
+
+# Set number of cores for parallel processing
+ncore = 4
+```
+
+```{r}
+region_str = "chr5:180328600-180329100"
+region_gr <- as(region_str, "GRanges")
+region <- as.data.frame(region_gr) %>% dplyr::rename(chr = seqnames) %>% select(chr, start, end)
+
+# select samples
+sample_names <- selected_sample_table$sample_name
+sample_IDs <- selected_sample_table$cell_line
+cat(length(sample_names), "selected samples. \n")
+```
+
+```{r}
+parsed_res_dir <- file.path(parsed_result_dir, region_str)
+result_dirs <- mclapply(1:nrow(selected_sample_table), function(i){
+  sample_name = selected_sample_table$sample_name[i]
+  sample_ID = selected_sample_table$cell_line[i]
+  cat("sample_name:", sample_name, "sample_ID:", sample_ID, "\n")
+  bam_file = selected_sample_table$bam_file[i]
+  vcf_file = selected_sample_table$phased_vcf_file[i]
+  fire_dir = selected_sample_table$fire_dir[i]
+  fire_name = selected_sample_table$sample_name[i]
+  fiberhmm_file = paste0(fiberhmm_result_dir, "/", sample_name, "/joint_trained_results/", sample_name, "_", region$chr, "_fp.bed.gz")
+  if (!file.exists(fiberhmm_file)){
+    stop("FiberHMM result does not exist: ", fiberhmm_file, "\n")
+  }
+  extract_region_result(sample_name, sample_ID, region_str, bam_file, fire_dir, fire_name, 
+                        fiberhmm_file, vcf_file, parsed_res_dir, 
+                        skip_if_exist = TRUE)
+}, mc.cores = ncore)
+
+```
+
+```{r}
+result_dirs <- unlist(result_dirs)
+names(result_dirs) <- sample_names
+selected_sample_table$result_dir <- result_dirs
+
+# print the sample table for selected samples
+DT::datatable(selected_sample_table[, c("sample_name", "cell_line", "result_dir")], 
+              options = list(pageLength = nrow(selected_sample_table), scrollX = TRUE))
+
+```
+
+Plot region and highlight CTCF motif position chr5:180328835-180328849 (MA0139.2)
+
+```{r}
+
+plot_name = "CTCF"
+subtitle = region_str
+
+# FP peaks to show in the plot
+peak_file_10_30bp = file.path(refined_peak_dir, "combined_all_chrs_10-30bp_macs3_q0.01_minratio0.5_refined_peaks.bed.gz")
+peak_file_30_60bp = file.path(refined_peak_dir, "combined_all_chrs_30-60bp_macs3_q0.01_minratio0.5_refined_peaks.bed.gz")
+peak_file_60_80bp = file.path(refined_peak_dir, "combined_all_chrs_60-80bp_macs3_q0.01_minratio0.5_refined_peaks.bed.gz")
+peaks_10_30bp <- read_peaks_region(peak_file_10_30bp, region)
+peaks_30_60bp <- read_peaks_region(peak_file_30_60bp, region)
+peaks_60_80bp <- read_peaks_region(peak_file_60_80bp, region)
+
+FP_peaks_list <- list(
+  "10-30bp FP" = peaks_10_30bp,
+  "30-60bp FP" = peaks_30_60bp,
+  "60-80bp FP" = peaks_60_80bp)
+
+# Top motif clusters in the motif region
+# chr5:180328835-180328849 (MA0139.2)
+motif_region <- data.frame(chr = "chr5", start = 180328835, end = 180328849)
+
+top_motif_clusters_list <- read_top_motif_clusters_region(motif_clustering_file, motif_region, 
+                                                          minoverlap = 1, min_score = 5, top_n = 5, 
+                                                          verbose = TRUE)
+
+
+```
+
+load CFCF ChIP-seq data
+```{r}
+extraCols_narrowPeak <- c(signalValue = "numeric", pValue = "numeric",
+                          qValue = "numeric", peak = "integer")
+
+
+ctcf_peaks <- rtracklayer::import(
+  "/project/spott/cshan/annotations/CTCF_ENCFF960ZGP_narrowPeak.bed",
+  format = "BED",
+  extraCols = extraCols_narrowPeak
+) %>%
+  as.data.frame() %>%
+  dplyr::rename(chr = seqnames)
+
+ctcf_peaks$chr <- as.character(ctcf_peaks$chr)
+
+# subset CTCF peaks to region
+ctcf_peaks_region <- ctcf_peaks %>%
+  dplyr::filter(chr == region$chr,
+                end >= region$start,
+                start <= region$end)
+
+ctcf_peaks_region <- ctcf_peaks_region %>%
+  dplyr::select(chr, start, end)
+
+nrow(ctcf_peaks_region)
+
+
+
+# CTCF bigwig
+
+ctcf_bw <- rtracklayer::import(
+  "/project/spott/cshan/annotations/CTCF_ENCFF636ODI.bigWig",
+  which = GRanges(region$chr, IRanges(region$start, region$end))) %>%
+  as.data.frame()
+
+ctcf_bw <- ctcf_bw %>%
+  dplyr::rename(chr = seqnames) %>%
+  dplyr::mutate(chr = as.character(chr))
+
+ctcf_track <- ggplot(ctcf_bw) +
+  geom_area(aes(x = start, y = score), fill = "steelblue", alpha = 0.7) +
+  xlim(region$start, region$end) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+print(ctcf_track)
+```
+
+Overlay CTCF peaks with DNase-seq
+
+DNase-seq data is obtained from: https://www.encodeproject.org/experiments/ENCSR000EMT/ 
+  - https://www.encodeproject.org/files/ENCFF743ULW/@@download/ENCFF743ULW.bigWig
+  - https://www.encodeproject.org/files/ENCFF073ORT/@@download/ENCFF073ORT.bed.gz 
+  
+  
+
+```{r}
+# reformat Dnase bed file to add back column names
+
+extraCols_narrowPeak <- c(signalValue = "numeric", pValue = "numeric",
+                          qValue = "numeric", peak = "integer")
+
+dnase_peaks <- rtracklayer::import(
+  "/project/spott/cshan/annotations/DNase_ENCFF073ORT.bed", format = "BED",extraCols = extraCols_narrowPeak) %>%
+  as.data.frame() %>%
+  dplyr::rename(chr = seqnames)
+
+dnase_peaks$chr <- as.character(dnase_peaks$chr)
+
+# subset CTCF peaks to region
+dnase_peaks_region <- dnase_peaks %>%
+  dplyr::filter(chr == region$chr,
+                end >= region$start,
+                start <= region$end)
+
+dnase_peaks_region <- dnase_peaks_region %>%
+  dplyr::select(chr, start, end)
+
+nrow(dnase_peaks_region)
+
+
+
+# Dnase bigwig
+dnase_bw <- rtracklayer::import(
+  "/project/spott/cshan/annotations/DNase.ENCFF743ULW.bigWig",
+  which = GRanges(region$chr, IRanges(region$start, region$end))) %>%
+  as.data.frame()
+
+dnase_bw <- dnase_bw %>%
+  dplyr::rename(chr = seqnames) %>%
+  dplyr::mutate(chr = as.character(chr))
+
+dnase_track <- ggplot(dnase_bw) +
+  geom_area(aes(x = start, y = score), fill = "darkred", alpha = 0.7) +
+  xlim(region$start, region$end) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+print(dnase_track)
+
+```
+
+
+```{r}
+combined_peaks_df$group <- factor(combined_peaks_df$group, 
+                                   levels = rev(c("CTCF ChIP-seq", "DNase-seq")))
+combined_peaks_df$y <- as.numeric(combined_peaks_df$group)
+
+combined_peak_track <- ggplot(combined_peaks_df, 
+                               aes(x = start, xend = end, y = y, yend = y, color = group)) +
+  geom_segment(linewidth = 1) +
+  scale_color_manual(values = c("CTCF ChIP-seq" = "steelblue", 
+                                 "DNase-seq" = "darkred")) +
+  labs(x = NULL, y = NULL) +
+  scale_x_continuous(limits = c(region$start, region$end), expand = c(0, 0)) +
+  scale_y_continuous(breaks = sort(unique(combined_peaks_df$y)),
+                     labels = levels(combined_peaks_df$group),
+                     expand = expansion(add = 0.5)) +
+  theme(legend.position = "none") +
+  coord_cartesian(xlim = c(region$start, region$end), expand = TRUE)
+
+print(combined_peak_track)
+```
+
+```{r}
+peaks_list <- c(
+  FP_peaks_list,
+  top_motif_clusters_list)
+
+# Cluster FiberHMM short footprints in the regions
+cluster_regions <- motif_region
+cluster_regions$start <- motif_region$start - 10
+cluster_regions$end <- motif_region$end + 10
+
+# combine results in the region and make plots
+res <- get_region_combined_results(result_dirs = result_dirs,
+                                   region = region,
+                                   sample_names = sample_names,
+                                   sample_IDs = sample_IDs,
+                                   peaks = peaks_list,
+                                   select_A_only = TRUE,
+                                   fiberHMM_size_breaks = c(30, 60, 80),
+                                   fiberHMM_cols = c("purple", "magenta", "#41c4e1", "darkgreen"),
+                                   cover_region_only = TRUE,
+                                   cover_cluster_regions_only = TRUE,
+                                   remove_unknown_tag = TRUE,
+                                   remove_unphased = TRUE,
+                                   cluster = "fiberHMM_configs",
+                                   cluster_regions = cluster_regions,
+                                   cluster_fp_size = c(10, 30),
+                                   config_levels = c("0", "1"),
+                                   highlight_window = motif_region,
+                                   color_highlight_window = "#50d844",
+                                   linewidth = 0.5,
+                                   smooth_pileup = TRUE,
+                                   window_n = 10,
+                                   plot_name = plot_name,
+                                   subtitle = subtitle,
+                                   verbose = TRUE)
+
+
+```
+
+
+```{r}
+gg <- res$gg
+
+# Combine all plots
+gg_combined <- gg$pileup_groups +
+  gg$peaks + ylab("") +
+  gg$fire_fdr + ylab("") +
+  combined_peak_track +   # Combined CTCF and DNase peaks track
+  ctcf_track +  
+  dnase_track +
+  (gg$dimelo_reads + ylab("SMF reads")) +
+  (gg$fire_fiberHMM + xlab(region$chr) + ylab("FIRE polished FiberHMM") +
+     theme(legend.position = 'right')) + 
+  plot_layout(ncol = 1, heights = c(4, 3, 1, 2, 2, 2, 8, 8))
+
+print(gg_combined)
+
+# Save the plot
+pdf("/project/spott/cshan/fiber-seq/results/extract_region_result_test/ctcf_chr5_180328600_180329100.pdf", 
+    height = 11, width = 12)
+gg_combined
+dev.off()
+
+
+```
+
+
+# Find CTCF motifs across the genome
+
+I want to first prepare the reference genome for TF and interest, as weell as the motifs for TF of interest
+
+
+- TSS from GENCODE: GetTsite was used to extract TSS from gencode GTF file and export as bed format (https://github.com/junjunlab/GetTsite)
+- CTCF ChIP-seq in LCL (GM12878): https://www.encodeproject.org/experiments/ENCSR000DZN/
+
+```{r}
+example_ctcf_fp <- fread("/project/spott/cshan/fiber-seq/results/per_sample/AL10_bc2178_19130.5mC.6mA.nuc.aligned/footprints/CTCF_footprint_ge20fibers.clean.tsv")
+
+example_ctcf_fp
+```
+
+I ran this script to get the CTCF footprint from motifs /project/spott/cshan/fiber-seq/code/ctcf_footprinting_slurm.sh
+
+
+```{r ctcf-tf, warning=FALSE}
+#===============================================================================
+# CTCF Footprint Post-Processing in R
+#
+# 1. Parse footprint codes from ft footprint output 
+# 2. Summarize across all 34 samples
+# 3. Generate plots
+
+#===============================================================================
+
+
+
+#===============================================================================
+# PATHS
+#===============================================================================
+results_dir <- "/project/spott/cshan/fiber-seq/results"
+plot_dir    <- file.path(results_dir, "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+Sys.setenv(TMPDIR = "/project/spott/cshan/fiber-seq/results/tmp")
+dir.create(Sys.getenv("TMPDIR"), showWarnings = FALSE, recursive = TRUE)
+
+#===============================================================================
+# STEP 1: Parse footprint codes for all samples
+#===============================================================================
+cat("=== STEP 1: Parse footprint codes ===\n")
+
+# Find all filtered footprint files
+fp_files <- list.files(
+  file.path(results_dir, "per_sample"),
+  pattern = "CTCF_footprint_ge20fibers.tsv",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat(sprintf("Found %d samples\n", length(fp_files)))
+
+# Function to parse footprint codes for one sample
+parse_footprint_codes <- function(fp_file) {
+  
+  sample_name <- basename(dirname(dirname(fp_file)))
+  cat(sprintf("  Parsing: %s\n", sample_name))
+  
+  dt <- fread(fp_file, sep = "\t")
+  
+  # Fix column names
+  setnames(dt, "#chrom", "chrom")
+  setnames(dt, c("start", "end"), c("fp_start", "fp_end"), skip_absent = TRUE)
+  
+  dt[, site_id := paste(chrom, fp_start, fp_end, strand, sep = ":")]
+  
+  result <- dt[, {
+    codes <- as.integer(strsplit(as.character(footprint_codes), ",")[[1]])
+    n <- length(codes)
+    
+    has_msp <- bitwAnd(codes, 1L) > 0L
+    has_fp  <- bitwAnd(codes, 2L) > 0L
+    
+    n_inacc   <- sum(!has_msp)
+    n_unbound <- sum(has_msp & !has_fp)
+    n_bound   <- sum(has_msp & has_fp)
+    
+    list(
+      n_fibers              = n,
+      n_bound               = n_bound,
+      n_accessible_unbound  = n_unbound,
+      n_inaccessible        = n_inacc,
+      pct_bound             = n_bound / n * 100,
+      pct_accessible_unbound = n_unbound / n * 100,
+      pct_inaccessible      = n_inacc / n * 100
+    )
+  }, by = .(chrom, fp_start, fp_end, strand, site_id)]
+  
+  result[, sample := sample_name]
+  setnames(result, c("fp_start", "fp_end"), c("start", "end"))
+  
+  cat(sprintf("    %d sites, %d total fibers\n", nrow(result), sum(result$n_fibers)))
+  cat(sprintf("    Bound: %.1f%% | Unbound: %.1f%% | Inaccessible: %.1f%%\n",
+              sum(result$n_bound) / sum(result$n_fibers) * 100,
+              sum(result$n_accessible_unbound) / sum(result$n_fibers) * 100,
+              sum(result$n_inaccessible) / sum(result$n_fibers) * 100))
+  
+  return(result)
+}
+
+# Parse all samples
+all_parsed <- map_dfr(fp_files, parse_footprint_codes)
+
+# Filter out AL29 samples
+all_parsed <- all_parsed %>%
+  filter(!grepl("^AL29", sample))
+
+# Save combined per-site data
+fwrite(all_parsed, file.path(results_dir, "CTCF_all_samples_per_site.tsv"), sep = "\t")
+cat(sprintf("\nSaved: CTCF_all_samples_per_site.tsv (%d rows)\n", nrow(all_parsed)))
+
+#===============================================================================
+# STEP 2: Cross-sample summary
+#===============================================================================
+dir.create(file.path(results_dir, "tmp"), showWarnings = FALSE)
+Sys.setenv(TMPDIR = file.path(results_dir, "tmp"))
+
+cat("\n=== STEP 2: Cross-sample summary ===\n")
+
+# Extract short sample name (AL## part)
+sample_summary <- all_parsed %>%
+  group_by(sample) %>%
+  summarise(
+    n_sites       = n(),
+    total_fibers  = sum(n_fibers),
+    total_bound   = sum(n_bound),
+    total_unbound = sum(n_accessible_unbound),
+    total_inacc   = sum(n_inaccessible),
+    pct_bound     = total_bound / total_fibers * 100,
+    pct_unbound   = total_unbound / total_fibers * 100,
+    pct_inacc     = total_inacc / total_fibers * 100,
+    mean_site_pct_bound   = mean(pct_bound),
+    mean_site_pct_unbound = mean(pct_accessible_unbound),
+    mean_site_pct_inacc   = mean(pct_inaccessible),
+    .groups = "drop"
+  ) %>%
+  mutate(short_name = stringr::str_extract(sample, "AL\\d+"))
+
+fwrite(sample_summary, file.path(results_dir, "CTCF_footprint_summary_all_samples.tsv"), sep = "\t")
+cat(sprintf("Saved summary for %d samples\n", nrow(sample_summary)))
+print(sample_summary %>% select(short_name, n_sites, total_fibers, pct_bound, pct_unbound, pct_inacc))
+```
+
+
