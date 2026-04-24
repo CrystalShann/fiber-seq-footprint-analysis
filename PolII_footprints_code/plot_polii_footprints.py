@@ -50,8 +50,11 @@ DEFAULT_OUT_DIR = "/project/spott/cshan/fiber-seq/results/PolII/plots"
 FP_COLORS = {
     "PPP": "#FF69B4",
     "PIC": "#4169E1",
-    "nucleosome": "#2E8B57",
+    "nucleosome (140-160)": "#2E8B57",
     "FIRE_nucleosome": "#FFA500",
+    "FIRE 80-100": "#08311CD2",
+    "FIRE 100-120": "#00BCD4",
+    "FIRE 120-140": "#856CDF",
     "unknown": "#AAAAAA",
 }
 
@@ -64,11 +67,31 @@ TRACK_COLORS = {
 }
 TRACK_LABELS = {
     "10-30": "10-30 bp",
-    "30-60": "30-60 bp (PPP)",
+    "30-60": "25-55 bp (PPP)",
     "60-80": "60-80 bp (PIC)",
     "140-160": "140-160 bp (nucleosome)",
 }
 N_BINS = 500
+
+FIRE_FP_PEAKS_DIR = "/project/spott/cshan/fiber-seq/results/PolII/FIRE_combined_footprints/joint_trained_peaks/"
+FIRE_FP_TRACKS_DIR = "/project/spott/cshan/fiber-seq/results/PolII/FIRE_combined_footprints/joint_trained_tracks/"
+
+FIRE_FP_FILES = {
+    "80-100": FIRE_FP_PEAKS_DIR + "combined_all_chrs_80-100bp_fps.bed.gz",
+    "100-120": FIRE_FP_PEAKS_DIR + "combined_all_chrs_100-120bp_fps.bed.gz",
+    "120-140": FIRE_FP_PEAKS_DIR + "combined_all_chrs_120-140bp_fps.bed.gz",
+}
+FIRE_FP_SIZES = ["80-100", "100-120", "120-140"]
+FIRE_FP_TRACK_COLORS = {
+    "80-100": "#E67E00",
+    "100-120": "#00BCD4",
+    "120-140": "#FFBD00",
+}
+FIRE_FP_TRACK_LABELS = {
+    "80-100": "80-100 bp (FIRE)",
+    "100-120": "100-120 bp (FIRE)",
+    "120-140": "120-140 bp (FIRE)",
+}
 
 
 def _read_table_auto(path):
@@ -253,17 +276,23 @@ def _resolve_tss(gene, requested_tss_column):
 
 
 def classify_by_size(size):
-    if 40 <= size <= 60:
+    if 25 <= size <= 55:
         return "PPP"
     if 60 < size <= 80:
         return "PIC"
     if 140 <= size <= 160:
-        return "nucleosome"
+        return "nucleosome (140-160)"
     return "unknown"
 
 
-def collect_reads(locus_chrom, view_start, view_end):
-    """Collect footprints per read in the requested window."""
+def collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=True):
+    """Collect footprints per read in the requested window.
+
+    show_fire_nuc=True  → include orange FIRE nucleosome marks (parsed nuc files);
+                          FIRE_combined_footprints per-read marks are NOT added.
+    show_fire_nuc=False → include FIRE_combined_footprints per-read marks (80-140 bp);
+                          orange FIRE nucleosome marks are NOT added.
+    """
     reads = defaultdict(list)
     for label, fp_file in FP_FILES.items():
         tbx = pysam.TabixFile(fp_file)
@@ -278,24 +307,39 @@ def collect_reads(locus_chrom, view_start, view_end):
             pass
         tbx.close()
 
-    fire_nuc_path = os.path.join(
-        FIRE_NUC_DIR, "sorted_indexed",
-        f"all_samples_nuc_{locus_chrom}_parsed_sorted.bed.gz",
-    )
-    if os.path.exists(fire_nuc_path):
-        tbx = pysam.TabixFile(fire_nuc_path)
-        try:
-            for row in tbx.fetch(locus_chrom, view_start, view_end):
-                f = row.split("\t")
-                if len(f) < 4:
-                    continue
-                nuc_start, nuc_end, read_name = int(f[1]), int(f[2]), f[3]
-                reads[read_name].append(
-                    (nuc_start, nuc_end, "FIRE_nucleosome", FP_COLORS["FIRE_nucleosome"])
-                )
-        except (ValueError, KeyError):
-            pass
-        tbx.close()
+    if show_fire_nuc:
+        fire_nuc_path = os.path.join(
+            FIRE_NUC_DIR, "sorted_indexed",
+            f"all_samples_nuc_{locus_chrom}_parsed_sorted.bed.gz",
+        )
+        if os.path.exists(fire_nuc_path):
+            tbx = pysam.TabixFile(fire_nuc_path)
+            try:
+                for row in tbx.fetch(locus_chrom, view_start, view_end):
+                    f = row.split("\t")
+                    if len(f) < 4:
+                        continue
+                    nuc_start, nuc_end, read_name = int(f[1]), int(f[2]), f[3]
+                    reads[read_name].append(
+                        (nuc_start, nuc_end, "FIRE_nucleosome", FP_COLORS["FIRE_nucleosome"])
+                    )
+            except (ValueError, KeyError):
+                pass
+            tbx.close()
+    else:
+        for label, fp_file in FIRE_FP_FILES.items():
+            cls = f"FIRE {label}"
+            tbx = pysam.TabixFile(fp_file)
+            try:
+                for row in tbx.fetch(locus_chrom, view_start, view_end):
+                    f = row.split("\t")
+                    fp_start, fp_end, read_name = int(f[1]), int(f[2]), f[3]
+                    reads[read_name].append(
+                        (fp_start, fp_end, cls, FP_COLORS[cls])
+                    )
+            except (ValueError, KeyError):
+                pass
+            tbx.close()
     return reads
 
 
@@ -310,11 +354,20 @@ def fetch_bw(bw_path, chrom, start, end, n_bins=N_BINS):
         return np.linspace(start, end, n_bins), np.zeros(n_bins)
 
 
-def _tss_order_key(footprints, tss_pos):
-    """Sort reads by the footprint center closest to the TSS."""
-    nearest_center_dist = min(abs(((fp_start + fp_end) / 2) - tss_pos) for fp_start, fp_end, _, _ in footprints)
-    leftmost_start = min(fp_start for fp_start, _, _, _ in footprints)
-    return nearest_center_dist, leftmost_start
+def _nuc_order_key(footprints, nuc_cls, tss_pos):
+    """Sort reads by the center of the nucleosome closest to the TSS.
+
+    Uses footprints of nuc_cls only; reads with no such footprint sort last.
+    """
+    centers = [
+        (fp_start + fp_end) / 2
+        for fp_start, fp_end, cls, _ in footprints
+        if cls == nuc_cls
+    ]
+    if centers:
+        nearest = min(centers, key=lambda c: abs(c - tss_pos))
+        return (abs(nearest - tss_pos), nearest)
+    return (float("inf"), min(fp[0] for fp in footprints))
 
 
 def plot_gene_footprints(
@@ -328,6 +381,7 @@ def plot_gene_footprints(
     tss_column="tss",
     gene_column="gene_name",
     show=True,
+    show_fire_nuc=True,
 ):
     """Create the gene-centric Pol II footprint plot and save it as PDF."""
     if genes_df is None:
@@ -352,7 +406,7 @@ def plot_gene_footprints(
     if not (0 < min_window_span_fraction <= 1):
         raise ValueError("min_window_span_fraction must be in the interval (0, 1].")
 
-    reads = collect_reads(locus_chrom, view_start, view_end)
+    reads = collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=show_fire_nuc)
     print(list(reads.items())[:5])
 
     span_margin = int(round(window_size * (1 - min_window_span_fraction)))
@@ -366,8 +420,10 @@ def plot_gene_footprints(
         if r_start <= min_left and r_end >= max_right:
             span_filtered_reads[read_name] = footprints
 
+    nuc_cls = "FIRE_nucleosome" if show_fire_nuc else "nucleosome (140-160)"
     read_list = sorted(
-        span_filtered_reads.items(), key=lambda kv: _tss_order_key(kv[1], locus_center)
+        span_filtered_reads.items(),
+        key=lambda kv: _nuc_order_key(kv[1], nuc_cls, locus_center),
     )
     read_list = read_list[:max_reads]
 
@@ -387,19 +443,31 @@ def plot_gene_footprints(
 
     chr_track_dir = f"{TRACKS_DIR}/{locus_chrom}/"
 
+    # (slab, color, display_label, bw_directory) — order determines y-position in top panel
+    track_defs = [
+        (s, TRACK_COLORS[s], TRACK_LABELS[s], chr_track_dir) for s in TRACK_SIZES
+    ]
+    if not show_fire_nuc:
+        fire_fp_chr_dir = f"{FIRE_FP_TRACKS_DIR}/{locus_chrom}"
+        track_defs += [
+            (s, FIRE_FP_TRACK_COLORS[s], FIRE_FP_TRACK_LABELS[s], fire_fp_chr_dir)
+            for s in FIRE_FP_SIZES
+        ]
+
     n_reads = len(read_list)
+    n_top = len(track_defs)
     fig = plt.figure(figsize=(14, 3.5 + 0.10 * n_reads))
     gs = plt.GridSpec(
         2,
         1,
-        height_ratios=[1.8, max(2.5, 0.10 * n_reads)],
+        height_ratios=[0.45 * n_top, max(2.5, 0.10 * n_reads)],
         hspace=0.04,
     )
     ax_top = fig.add_subplot(gs[0])
     ax_bot = fig.add_subplot(gs[1], sharex=ax_top)
 
-    for i, slab in enumerate(TRACK_SIZES):
-        bw_path = f"{chr_track_dir}/combined_{locus_chrom}_{slab}bp_fp_cov.bw"
+    for i, (slab, color, label, track_dir) in enumerate(track_defs):
+        bw_path = f"{track_dir}/combined_{locus_chrom}_{slab}bp_fp_cov.bw"
         pos, vals = fetch_bw(bw_path, locus_chrom, view_start, view_end)
         vmax = vals.max() or 1
         offset = i * 1.1
@@ -407,14 +475,14 @@ def plot_gene_footprints(
             pos,
             offset,
             offset + vals / vmax,
-            color=TRACK_COLORS[slab],
+            color=color,
             alpha=0.85,
-            label=TRACK_LABELS[slab],
+            label=label,
         )
 
     ax_top.axvline(locus_center, color="black", lw=1, ls="--", alpha=0.5)
-    ax_top.set_yticks(np.arange(len(TRACK_SIZES)) * 1.1 + 0.5)
-    ax_top.set_yticklabels([TRACK_LABELS[s] for s in TRACK_SIZES], fontsize=8)
+    ax_top.set_yticks(np.arange(n_top) * 1.1 + 0.5)
+    ax_top.set_yticklabels([td[2] for td in track_defs], fontsize=8)
     ax_top.set_ylabel("Footprint size")
     ax_top.set_title(
         f"{gene_name}  |  {locus_chrom}:{view_start:,}-{view_end:,}  ({locus_strand})",
@@ -448,7 +516,12 @@ def plot_gene_footprints(
     ax_bot.set_ylabel(f"Reads  (n={n_reads})", fontsize=9)
     ax_bot.set_xlabel(f"Genomic position  ({locus_chrom})", fontsize=9)
 
-    legend_patches = [plt.matplotlib.patches.Patch(color=c, label=l) for l, c in FP_COLORS.items()]
+    used_cls = {cls for fps in reads.values() for _, _, cls, _ in fps}
+    legend_patches = [
+        plt.matplotlib.patches.Patch(color=FP_COLORS[cls], label=cls)
+        for cls in FP_COLORS
+        if cls in used_cls
+    ]
     ax_bot.legend(handles=legend_patches, fontsize=7, loc="upper right", ncol=2)
 
     plt.setp(ax_top.get_xticklabels(), visible=False)
@@ -517,6 +590,14 @@ def build_argparser():
         action="store_true",
         help="Save the plot without opening an interactive window.",
     )
+    p.add_argument(
+        "--no-fire-nuc",
+        action="store_true",
+        help=(
+            "Hide orange FIRE nucleosome marks and show FIRE_combined_footprints "
+            "(80-140 bp) bigwig tracks and per-read marks instead."
+        ),
+    )
     return p
 
 
@@ -533,6 +614,7 @@ def main(argv=None):
         tss_column=args.tss_column,
         gene_column=args.gene_column,
         show=not args.no_show,
+        show_fire_nuc=not args.no_fire_nuc,
     )
 
 
