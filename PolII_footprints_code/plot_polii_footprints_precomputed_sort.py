@@ -7,7 +7,8 @@ You can:
   2. import it from another script or notebook and call plot_gene_footprints()
 
 Example:
-  python3 plot_polii_footprints.py --gene ACTB --window-size 2000
+  python3 plot_polii_footprints_precomputed_sort.py --gene ACTB --window-size 2000 \
+      --fp-class FIRE_nucleosome --plot-mode midpoint
 """
 
 import argparse
@@ -46,6 +47,28 @@ PAUSING_INDEX_PRINCIPAL_CSV = f"{ANNOTATION_DIR}/pausing_index_principal.csv"
 CLOSEST_CAGE_TSS_CSV = f"{ANNOTATION_DIR}/closest_CAGE_TSS_to_genes_in_pausing_index_principal.csv"
 DEFAULT_PRINCIPAL_WITH_CAGE_CSV = f"{ANNOTATION_DIR}/pausing_index_principal_with_CAGE_TSS_all_genes.tsv"
 DEFAULT_OUT_DIR = "/project/spott/cshan/fiber-seq/results/PolII/plots"
+DEFAULT_FP_SUMMARY_DIR = "/project/spott/cshan/fiber-seq/results/PolII/footprint_summaries"
+DEFAULT_FP_BED_DIR = "/project/spott/cshan/fiber-seq/results/PolII/footprint_summary_beds"
+
+CLASS_SUBDIRS = {
+    "PPP": "PPP",
+    "PIC": "PIC",
+    "nucleosome (140-160)": "nucleosome_140-160",
+    "FIRE_nucleosome": "FIRE_nucleosome",
+    "unknown": "unknown",
+}
+CLASS_ALIASES = {
+    "ppp": "PPP",
+    "pic": "PIC",
+    "nucleosome": "nucleosome (140-160)",
+    "nucleosome_140-160": "nucleosome (140-160)",
+    "nucleosome (140-160)": "nucleosome (140-160)",
+    "fire_nucleosome": "FIRE_nucleosome",
+    "fire-nucleosome": "FIRE_nucleosome",
+    "fire": "FIRE_nucleosome",
+    "unknown": "unknown",
+    "all": "all",
+}
 
 FP_COLORS = {
     "PPP": "#FF69B4",
@@ -67,7 +90,7 @@ TRACK_COLORS = {
 }
 TRACK_LABELS = {
     "10-30": "10-30 bp",
-    "30-60": "25-55 bp (PPP)",
+    "30-60": "40-60 bp (PPP)",
     "60-80": "60-80 bp (PIC)",
     "140-160": "140-160 bp (nucleosome)",
 }
@@ -278,7 +301,7 @@ def _resolve_tss(gene, requested_tss_column):
 
 
 def classify_by_size(size):
-    if 25 <= size <= 55:
+    if 40 <= size <= 60:
         return "PPP"
     if 60 < size <= 80:
         return "PIC"
@@ -345,6 +368,91 @@ def collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=True):
     return reads
 
 
+def _normalize_fp_class(fp_class):
+    key = str(fp_class).strip()
+    normalized = CLASS_ALIASES.get(key.lower())
+    if normalized is None:
+        choices = ", ".join(["all"] + list(CLASS_SUBDIRS))
+        raise ValueError(f"Unknown fp_class '{fp_class}'. Choose one of: {choices}")
+    return normalized
+
+
+def _summary_classes(fp_class):
+    fp_class = _normalize_fp_class(fp_class)
+    if fp_class == "all":
+        return list(CLASS_SUBDIRS)
+    return [fp_class]
+
+
+def collect_reads_from_summaries(
+    locus_chrom,
+    view_start,
+    view_end,
+    fp_class="FIRE_nucleosome",
+    summaries_dir=DEFAULT_FP_SUMMARY_DIR,
+):
+    """Collect precomputed summary footprints per read for a class or all classes."""
+    reads = defaultdict(list)
+    for cls in _summary_classes(fp_class):
+        path = os.path.join(
+            summaries_dir,
+            CLASS_SUBDIRS[cls],
+            f"{locus_chrom}_footprints.tsv.gz",
+        )
+        if not os.path.exists(path):
+            print(f"  [WARN] missing summary file for {cls}: {path}")
+            continue
+
+        chunks = pd.read_csv(
+            path,
+            sep="\t",
+            usecols=["read_name", "fp_start", "fp_end", "fp_class"],
+            chunksize=500_000,
+        )
+        color = FP_COLORS[cls]
+        for df in chunks:
+            df = df[(df["fp_end"] >= view_start) & (df["fp_start"] <= view_end)]
+            for row in df.itertuples(index=False):
+                reads[row.read_name].append(
+                    (int(row.fp_start), int(row.fp_end), cls, color)
+                )
+    return reads
+
+
+def collect_reads_from_indexed_beds(
+    locus_chrom,
+    view_start,
+    view_end,
+    fp_class="FIRE_nucleosome",
+    beds_dir=DEFAULT_FP_BED_DIR,
+):
+    """Collect precomputed summary footprints per read using tabix-indexed BED files.
+
+    BED columns: chrom, fp_start, fp_end, read_name, fp_class, fp_mid
+    """
+    reads = defaultdict(list)
+    for cls in _summary_classes(fp_class):
+        path = os.path.join(
+            beds_dir,
+            CLASS_SUBDIRS[cls],
+            f"{locus_chrom}_footprints.bed.gz",
+        )
+        if not os.path.exists(path):
+            print(f"  [WARN] missing indexed BED for {cls}: {path}")
+            continue
+        color = FP_COLORS[cls]
+        tbx = pysam.TabixFile(path)
+        try:
+            for row in tbx.fetch(locus_chrom, view_start, view_end):
+                f = row.split("\t")
+                fp_start, fp_end, read_name = int(f[1]), int(f[2]), f[3]
+                reads[read_name].append((fp_start, fp_end, cls, color))
+        except (ValueError, KeyError):
+            pass
+        tbx.close()
+    return reads
+
+
 def fetch_bw(bw_path, chrom, start, end, n_bins=N_BINS):
     try:
         bw = pyBigWig.open(bw_path)
@@ -356,19 +464,29 @@ def fetch_bw(bw_path, chrom, start, end, n_bins=N_BINS):
         return np.linspace(start, end, n_bins), np.zeros(n_bins)
 
 
-def _nuc_order_key(footprints, nuc_cls, tss_pos):
-    """Sort reads by the center of the nucleosome closest to the TSS.
+def _footprint_order_key(footprints, sort_cls, tss_pos, plot_mode="midpoint"):
+    """Sort reads by selected class midpoint or edge closest to the TSS.
 
-    Uses footprints of nuc_cls only; reads with no such footprint sort last.
+    Uses footprints of sort_cls only unless sort_cls='all'; reads with no matching
+    footprint sort last.
     """
-    centers = [
-        (fp_start + fp_end) / 2
-        for fp_start, fp_end, cls, _ in footprints
-        if cls == nuc_cls
-    ]
-    if centers:
-        nearest = min(centers, key=lambda c: abs(c - tss_pos))
-        return (abs(nearest - tss_pos), nearest)
+    candidates = []
+    for fp_start, fp_end, cls, _ in footprints:
+        if sort_cls != "all" and cls != sort_cls:
+            continue
+        if plot_mode == "midpoint":
+            anchor = (fp_start + fp_end) / 2
+            dist = abs(anchor - tss_pos)
+        elif plot_mode == "edge":
+            start_dist = abs(fp_start - tss_pos)
+            end_dist = abs(fp_end - tss_pos)
+            dist = min(start_dist, end_dist)
+            anchor = fp_start if start_dist <= end_dist else fp_end
+        else:
+            raise ValueError("plot_mode must be 'midpoint' or 'edge'.")
+        candidates.append((dist, anchor))
+    if candidates:
+        return min(candidates)
     return (float("inf"), min(fp[0] for fp in footprints))
 
 
@@ -384,6 +502,11 @@ def plot_gene_footprints(
     gene_column="gene_name",
     show=True,
     show_fire_nuc=True,
+    use_precomputed_summaries=True,
+    fp_class="FIRE_nucleosome",
+    plot_mode="midpoint",
+    fp_bed_dir=DEFAULT_FP_BED_DIR,
+    save_pdf=False,
 ):
     """Create the gene-centric Pol II footprint plot and save it as PDF."""
     if genes_df is None:
@@ -404,11 +527,36 @@ def plot_gene_footprints(
     print(f"TSS col: {tss_column}")
     print(f"TSS src: {tss_source}")
     print(f"Window : {view_end - view_start:,} bp")
+    print(f"FP data: {'indexed BED summaries' if use_precomputed_summaries else 'tabix footprint beds'}")
+    if use_precomputed_summaries:
+        fp_class = _normalize_fp_class(fp_class)
+        print(f"Class  : {fp_class}")
+        print(f"Mode   : {plot_mode}")
 
     if not (0 < min_window_span_fraction <= 1):
         raise ValueError("min_window_span_fraction must be in the interval (0, 1].")
 
-    reads = collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=show_fire_nuc)
+    if plot_mode not in {"midpoint", "edge"}:
+        raise ValueError("plot_mode must be 'midpoint' or 'edge'.")
+
+    if use_precomputed_summaries:
+        read_spans = collect_reads_from_indexed_beds(
+            locus_chrom,
+            view_start,
+            view_end,
+            fp_class="all",
+            beds_dir=fp_bed_dir,
+        )
+        reads = collect_reads_from_indexed_beds(
+            locus_chrom,
+            view_start,
+            view_end,
+            fp_class=fp_class,
+            beds_dir=fp_bed_dir,
+        )
+    else:
+        reads = collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=show_fire_nuc)
+        read_spans = reads
     print(list(reads.items())[:5])
 
     span_margin = int(round(window_size * (1 - min_window_span_fraction)))
@@ -417,19 +565,23 @@ def plot_gene_footprints(
 
     span_filtered_reads = {}
     for read_name, footprints in reads.items():
-        r_start = min(fp[0] for fp in footprints)
-        r_end = max(fp[1] for fp in footprints)
+        span_footprints = read_spans.get(read_name, footprints)
+        r_start = min(fp[0] for fp in span_footprints)
+        r_end = max(fp[1] for fp in span_footprints)
         if r_start <= min_left and r_end >= max_right:
-            span_filtered_reads[read_name] = footprints
+            # Store all-class footprints for display; sorting uses sort_cls filter internally.
+            span_filtered_reads[read_name] = read_spans.get(read_name, footprints)
 
-    nuc_cls = "FIRE_nucleosome" if show_fire_nuc else "nucleosome (140-160)"
+    sort_cls = fp_class if use_precomputed_summaries else (
+        "FIRE_nucleosome" if show_fire_nuc else "nucleosome (140-160)"
+    )
     read_list = sorted(
         span_filtered_reads.items(),
-        key=lambda kv: _nuc_order_key(kv[1], nuc_cls, locus_center),
+        key=lambda kv: _footprint_order_key(kv[1], sort_cls, locus_center, plot_mode),
     )
     read_list = read_list[:max_reads]
 
-    print(f"Reads with footprints in window: {len(reads):,}")
+    print(f"Reads with {fp_class} footprints in window: {len(reads):,}")
     print(
         f"Reads spanning >={min_window_span_fraction:.0%} of window "
         f"(start<={min_left:,}, end>={max_right:,}): {len(span_filtered_reads):,}"
@@ -478,7 +630,7 @@ def plot_gene_footprints(
     ax_top = fig.add_subplot(gs[0])
     ax_bot = fig.add_subplot(gs[1], sharex=ax_top)
 
-    for i, (slab, color, label, bw_path) in enumerate(track_defs):
+    for i, (_, color, label, bw_path) in enumerate(track_defs):
         pos, vals = fetch_bw(bw_path, locus_chrom, view_start, view_end)
         vmax = vals.max() or 1
         offset = i * 1.1
@@ -504,8 +656,9 @@ def plot_gene_footprints(
     # Explicit y-mapping so the first sorted read is always drawn on top.
     for idx, (read_name, footprints) in enumerate(read_list):
         y = n_reads - 1 - idx
-        r_start = min(fp[0] for fp in footprints)
-        r_end = max(fp[1] for fp in footprints)
+        span_footprints = read_spans.get(read_name, footprints)
+        r_start = min(fp[0] for fp in span_footprints)
+        r_end = max(fp[1] for fp in span_footprints)
         ax_bot.plot([r_start, r_end], [y, y], color="black", lw=0.4, zorder=1)
         for fp_start, fp_end, cls, color in footprints:
             ax_bot.add_patch(
@@ -538,15 +691,23 @@ def plot_gene_footprints(
     plt.setp(ax_top.get_xticklabels(), visible=False)
     plt.tight_layout()
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_base = f"{out_dir}/{gene_name}_footprints"
-    plt.savefig(out_base + ".pdf", bbox_inches="tight")
+    if save_pdf:
+        os.makedirs(out_dir, exist_ok=True)
+        if use_precomputed_summaries:
+            class_tag = CLASS_SUBDIRS.get(fp_class, "all")
+            out_base = f"{out_dir}/{gene_name}_{class_tag}_{plot_mode}_footprints"
+        else:
+            out_base = f"{out_dir}/{gene_name}_footprints"
+        plt.savefig(out_base + ".pdf", bbox_inches="tight")
+        print(f"Saved: {out_base}.pdf")
+    else:
+        out_base = None
+
     if show:
         plt.show()
     else:
         plt.close(fig)
 
-    print(f"Saved: {out_base}.pdf")
     return {
         "gene": gene,
         "out_base": out_base,
@@ -556,6 +717,7 @@ def plot_gene_footprints(
         "view_end": view_end,
         "locus_chrom": locus_chrom,
         "locus_center": locus_center,
+        "read_spans": read_spans,
     }
 
 
@@ -609,6 +771,45 @@ def build_argparser():
             "(80-140 bp) bigwig tracks and per-read marks instead."
         ),
     )
+    p.add_argument(
+        "--fp-bed-dir",
+        default=DEFAULT_FP_BED_DIR,
+        help=(
+            "Root directory of tabix-indexed BED summary files from "
+            f"index_fp_summaries_as_bed.py (default: {DEFAULT_FP_BED_DIR})."
+        ),
+    )
+    p.add_argument(
+        "--fp-class",
+        default="FIRE_nucleosome",
+        help=(
+            "Footprint class to plot/sort from precomputed summaries. "
+            "Accepted values: PPP, PIC, nucleosome_140-160, FIRE_nucleosome, "
+            "unknown, all. Default: FIRE_nucleosome."
+        ),
+    )
+    p.add_argument(
+        "--plot-mode",
+        choices=["midpoint", "edge"],
+        default="midpoint",
+        help=(
+            "Sort selected reads by the selected class footprint midpoint or nearest edge "
+            "relative to the TSS (default: midpoint)."
+        ),
+    )
+    p.add_argument(
+        "--save-pdf",
+        action="store_true",
+        help="Save the plot as a PDF file (default: do not save).",
+    )
+    p.add_argument(
+        "--use-tabix-beds",
+        action="store_true",
+        help=(
+            "Use the original tabix BED collection path instead of indexed BED summaries. "
+            "--fp-class and --fp-bed-dir are ignored in this mode."
+        ),
+    )
     return p
 
 
@@ -626,6 +827,11 @@ def main(argv=None):
         gene_column=args.gene_column,
         show=not args.no_show,
         show_fire_nuc=not args.no_fire_nuc,
+        use_precomputed_summaries=not args.use_tabix_beds,
+        fp_class=args.fp_class,
+        plot_mode=args.plot_mode,
+        fp_bed_dir=args.fp_bed_dir,
+        save_pdf=args.save_pdf,
     )
 
 

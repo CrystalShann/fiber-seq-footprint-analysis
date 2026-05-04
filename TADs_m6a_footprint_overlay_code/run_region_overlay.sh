@@ -95,14 +95,14 @@ fi
 module load python/miniforge-25.3.0
 source activate /project/spott/cshan/envs/Jupyter-notebook
 
-python "${PY_SCRIPT}" \
-  --sample "${SAMPLE}" \
-  --region "${REGION}" \
-  --metadata "${METADATA}" \
-  --output-root "${OUTPUT_ROOT}" \
-  --m6a-summary-track "${M6A_SUMMARY_TRACK}" \
-  --5mc-summary-track "${MC5_SUMMARY_TRACK}" \
-  --max-reads "${MAX_READS}" >/dev/null
+  python "${PY_SCRIPT}" \
+    --sample "${SAMPLE}" \
+    --region "${REGION}" \
+    --metadata "${METADATA}" \
+    --output-root "${OUTPUT_ROOT}" \
+    --m6a-summary-track "${M6A_SUMMARY_TRACK}" \
+    --5mc-summary-track "${MC5_SUMMARY_TRACK}" \
+    --max-reads "${MAX_READS}" >/dev/null
 
 pyGenomeTracks \
   --tracks "${TRACKS_INI}" \

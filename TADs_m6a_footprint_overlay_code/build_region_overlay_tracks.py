@@ -10,13 +10,14 @@ from collections import defaultdict
 METADATA_DEFAULT = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
 OUTPUT_ROOT_DEFAULT = "/project/spott/cshan/fiber-seq/results/TADs_m6a_footprint_overlay"
 TAD_BED = "/project/spott/cshan/fiber-seq/results/TADs_Fiber_MSP/pygenometracks_overlay/inputs/tads.bed"
-TAD_BOUNDARY_BED = "/project/spott/cshan/annotations/hic/ENCFF156ECM.bedpe.gz"
+TAD_BOUNDARY_BEDPE = "/project/spott/cshan/annotations/hic/ENCFF156ECM.bedpe.gz"
 CAGE_BED = "/project/spott/cshan/fiber-seq/results/TADs_m6a_footprint_overlay/inputs/cage_lcl_extended.bed.gz"
-HIC_MATRIX = "/project/spott/cshan/annotations/hic/ENCFF216QQM.cool"
+HIC_MATRIX = "/project/spott/cshan/annotations/hic/ENCFF216QQM.mcool"
 CTCF_BW = "/project/spott/cshan/annotations/CTCF_ENCFF636ODI.bigWig"
 DNASE_BW = "/project/spott/cshan/annotations/DNase.ENCFF743ULW.bigWig"
-SMALL_REGION_TAD_THRESHOLD = 500_000
 POLII_FP_BW_ROOT = "/project/spott/cshan/fiber-seq/results/PolII/FIRE_combined_footprints/joint_trained_tracks"
+FIRE_NUC_BW_ROOT = "/project/spott/cshan/fiber-seq/FIRE_nuc_by_chr_combined_sample/bigwig_files"
+FIRE_NUC_PARSED_BED_ROOT = "/project/spott/cshan/fiber-seq/FIRE_nuc_by_chr_combined_sample/parsed_bed_files/sorted_indexed"
 
 FP_BINS = [
     ("fp_10_30bp", 10, 30, "#08306b", "Footprint 10-30bp"),
@@ -34,6 +35,10 @@ POLII_COLORS = [
     "#f16913",
     "#a50f15",
 ]
+
+
+def open_maybe_gzip(path):
+    return gzip.open(path, "rt") if path.lower().endswith(".gz") else open(path, "rt")
 
 
 def discover_polii_bigwigs(chrom, root=POLII_FP_BW_ROOT):
@@ -70,6 +75,102 @@ def discover_polii_bigwigs(chrom, root=POLII_FP_BW_ROOT):
     for i, track in enumerate(tracks):
         track["color"] = POLII_COLORS[i % len(POLII_COLORS)]
     return tracks
+
+
+def discover_nucleosome_bigwig(chrom, root=FIRE_NUC_BW_ROOT):
+    filename = f"all_samples_nuc_{chrom}_parsed_sorted.bw"
+    path = os.path.join(root, filename)
+    return path if os.path.exists(path) else None
+
+
+def resolve_nucleosome_parsed_bed(chrom, root=FIRE_NUC_PARSED_BED_ROOT):
+    candidates = sorted(
+        set(
+            glob(os.path.join(root, f"all_samples_nuc_{chrom}_parsed_sorted.bed.gz"))
+            + glob(os.path.join(root, f"all_samples_nuc_{chrom}_sorted_parsed_sorted.bed.gz"))
+        )
+    )
+    if not candidates:
+        return None
+    preferred = [p for p in candidates if os.path.basename(p).startswith(f"all_samples_nuc_{chrom}_parsed_sorted")]
+    return preferred[0] if preferred else candidates[0]
+
+
+def merge_intervals(intervals):
+    if not intervals:
+        return []
+    intervals.sort(key=lambda x: (x[0], x[1]))
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def ensure_tad_boundary_bed(tad_bedpe_path, output_bed_path):
+    if os.path.exists(output_bed_path) and os.path.getsize(output_bed_path) > 0:
+        return output_bed_path
+
+    os.makedirs(os.path.dirname(output_bed_path), exist_ok=True)
+    by_chrom = defaultdict(list)
+
+    with open_maybe_gzip(tad_bedpe_path) as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 6:
+                continue
+            chrom1, start1, end1 = fields[0], int(fields[1]), int(fields[2])
+            chrom2, start2, end2 = fields[3], int(fields[4]), int(fields[5])
+            by_chrom[normalize_chrom(chrom1)].append((start1, end1))
+            by_chrom[normalize_chrom(chrom2)].append((start2, end2))
+
+    # write gzipped bed if requested
+    write_gz = str(output_bed_path).lower().endswith('.gz')
+    open_out = gzip.open if write_gz else open
+    with open_out(output_bed_path, 'wt') as out:
+        for chrom in sorted(by_chrom.keys()):
+            for start, end in merge_intervals(by_chrom[chrom]):
+                if end > start:
+                    out.write(f"{chrom}\t{start}\t{end}\n")
+
+    return output_bed_path
+
+
+def ensure_tad_line_bed(tad_bedpe_path, output_bed_path, line_width=10):
+    if os.path.exists(output_bed_path) and os.path.getsize(output_bed_path) > 0:
+        return output_bed_path
+
+    os.makedirs(os.path.dirname(output_bed_path), exist_ok=True)
+    by_chrom = defaultdict(list)
+
+    with open_maybe_gzip(tad_bedpe_path) as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 6:
+                continue
+            chrom1, start1, end1 = fields[0], int(fields[1]), int(fields[2])
+            chrom2, start2, end2 = fields[3], int(fields[4]), int(fields[5])
+            for chrom, start, end in ((chrom1, start1, end1), (chrom2, start2, end2)):
+                chrom = normalize_chrom(chrom)
+                by_chrom[chrom].append((start, start + line_width))
+                by_chrom[chrom].append((end, end + line_width))
+
+    write_gz = str(output_bed_path).lower().endswith(".gz")
+    open_out = gzip.open if write_gz else open
+    with open_out(output_bed_path, "wt") as out:
+        for chrom in sorted(by_chrom.keys()):
+            for start, end in merge_intervals(by_chrom[chrom]):
+                if end > start:
+                    out.write(f"{chrom}\t{start}\t{end}\n")
+
+    return output_bed_path
 
 
 def normalize_chrom(chrom):
@@ -120,6 +221,9 @@ def parse_int_list(value):
 
 def overlap(start, end, region_start, region_end):
     return max(0, min(end, region_end) - max(start, region_start))
+
+
+
 
 
 def clip_interval(start, end, region_start, region_end):
@@ -180,6 +284,32 @@ def collect_fp_records(path, chrom, region_start, region_end):
                     "end": row_end,
                     "item_rgb": fields[6],
                     "blocks": list(zip(block_starts, block_sizes)),
+                }
+            )
+    return records
+
+
+def collect_combined_nuc_records(path, chrom, region_start, region_end):
+    records = defaultdict(list)
+    with gzip.open(path, "rt") as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 4 or fields[0] != chrom:
+                continue
+            row_start = int(fields[1])
+            row_end = int(fields[2])
+            if row_end <= row_start or overlap(row_start, row_end, region_start, region_end) <= 0:
+                continue
+            read_id = fields[3]
+            size = row_end - row_start
+            records[read_id].append(
+                {
+                    "chrom": chrom,
+                    "name": read_id,
+                    "start": row_start,
+                    "end": row_end,
+                    "item_rgb": "0,0,0",
+                    "blocks": [(0, size)],
                 }
             )
     return records
@@ -276,6 +406,14 @@ def write_bed12(path, rows):
             handle.write("\t".join(map(str, row)) + "\n")
 
 
+def has_real_non_anchor_block(blocks, span_size):
+    anchor_blocks = {(0, 1), (max(0, span_size - 1), 1)}
+    for block in blocks:
+        if block not in anchor_blocks:
+            return True
+    return False
+
+
 def build_tracks(sample, chrom, region_start, region_end, read_order, read_spans, m6a_records, fp_records, region_dir):
     baseline_rows = []
     m6a_rows = []
@@ -333,8 +471,8 @@ def build_tracks(sample, chrom, region_start, region_end, read_order, read_spans
                 blocks = aggregate_clipped_blocks(
                     fp_records[read_id], span_start, region_start, region_end, size_range=(lower, upper), chrom_end=span_end
                 )
-                # Only write a row if there are real footprint blocks beyond the anchor
-                if len(blocks) > 1 or (len(blocks) == 1 and blocks[0][0] == 0 and blocks[0][1] > 1):
+                # Keep rows when at least one non-anchor block is present after clipping.
+                if has_real_non_anchor_block(blocks, span_size):
                     fp_rows[key].append(
                         [
                             chrom,
@@ -395,19 +533,33 @@ def write_tracks_ini(
     m6a_summary_track=None,
     mc5_summary_track=None,
     cpg_bed=None,
-    hic_depth=200000,
+    hic_depth=5000,
     tad_bed=TAD_BED,
-    tad_title="TADs (Arrowhead, GM12878)",
+    tad_title="TADs",
     show_hic=True,
 ):
     polii_tracks = discover_polii_bigwigs(chrom)
+    nuc_bw = discover_nucleosome_bigwig(chrom)
     with open(path, "w") as handle:
         handle.write("[x-axis]\nfontsize = 10\nwhere = top\n\n")
 
         if show_hic:
+            # pyGenomeTracks accepts .hic or .mcool; for .mcool include the group path
+            hic_file = HIC_MATRIX
+            hic_title = "Hi-C"
+            if isinstance(hic_file, str):
+                lower = hic_file.lower()
+                if lower.endswith('.mcool'):
+                    # default to requested resolution group
+                    if '::' not in hic_file:
+                        hic_file = f"{hic_file}::/resolutions/{hic_depth}"
+                    hic_title = f"Hi-C ({hic_depth} bp)"
+                elif lower.endswith('.hic'):
+                    hic_title = "Hi-C (.hic)"
+
             handle.write("[hic]\n")
-            handle.write(f"file = {HIC_MATRIX}\n")
-            handle.write("title = ENCFF216QQM Hi-C\n")
+            handle.write(f"file = {hic_file}\n")
+            handle.write(f"title = {hic_title}\n")
             handle.write(f"depth = {hic_depth}\nheight = 6\ncolormap = Reds\nfile_type = hic_matrix\n\n")
             handle.write("[spacer]\nheight = 0.3\n\n")
 
@@ -415,7 +567,7 @@ def write_tracks_ini(
         handle.write(f"file = {tad_bed}\n")
         handle.write(f"title = {tad_title}\n")
         handle.write(
-            "height = 2\ncolor = none\nborder_color = #e41a1c\nline_width = 1.5\nlabels = false\ndisplay = interleaved"
+            "height = 2\ncolor = #e41a1c\nborder_color = #e41a1c\nline_width = 1.5\nlabels = false\ndisplay = collapsed"
             f"\nfile_type = {tad_track_type(tad_bed)}\n\n"
         )
 
@@ -428,6 +580,13 @@ def write_tracks_ini(
             handle.write(f"file = {file_path}\n")
             handle.write(f"title = {title}\n")
             handle.write(f"height = 2\ncolor = {color}\nmin_value = 0\nshow_data_range = true\nfile_type = bigwig\n\n")
+
+        if nuc_bw is not None:
+            handle.write("[spacer]\nheight = 0.3\n\n")
+            handle.write("[nucleosome_cov]\n")
+            handle.write(f"file = {nuc_bw}\n")
+            handle.write("title = Nucleosome coverage (FIRE combined)\n")
+            handle.write("height = 1.8\ncolor = #ff7f0e\nmin_value = 0\nshow_data_range = true\nfile_type = bigwig\n\n")
 
         handle.write("[spacer]\nheight = 0.3\n\n")
         handle.write("[cage]\n")
@@ -518,20 +677,22 @@ def main():
     m6a_path = os.path.join(
         fire_dir, "extracted_results", "m6a_by_chr", f"{args.sample}.ft_extracted_m6a.{chrom}.bed.gz"
     )
-    fp_path = os.path.join(
-        "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged",
-        args.sample,
-        "joint_trained_results",
-        f"{args.sample}_{chrom}_fp.bed.gz",
-    )
+    fp_path = resolve_nucleosome_parsed_bed(chrom)
 
     if not os.path.exists(m6a_path):
         raise SystemExit(f"Missing sample m6A BED12: {m6a_path}")
-    if not os.path.exists(fp_path):
-        raise SystemExit(f"Missing sample FiberHMM footprint BED: {fp_path}")
+    if fp_path is None or not os.path.exists(fp_path):
+        raise SystemExit(f"Missing FIRE combined nucleosome BED for {chrom} under {FIRE_NUC_PARSED_BED_ROOT}")
+
+    # place converted boundaries into the annotations/hic folder so conversion is cached
+    annotations_dir = os.path.dirname(TAD_BOUNDARY_BEDPE)
+    converted_boundaries = os.path.join(annotations_dir, "ENCFF156ECM.boundaries.bed.gz")
+    ensure_tad_boundary_bed(TAD_BOUNDARY_BEDPE, converted_boundaries)
+    converted_boundary_lines = os.path.join(annotations_dir, "ENCFF156ECM.tad_lines.bed.gz")
+    boundary_lines_bed = ensure_tad_line_bed(TAD_BOUNDARY_BEDPE, converted_boundary_lines)
 
     m6a_records = collect_m6a_records(m6a_path, chrom, region_start, region_end)
-    fp_records = collect_fp_records(fp_path, chrom, region_start, region_end)
+    fp_records = collect_combined_nuc_records(fp_path, chrom, region_start, region_end)
     read_spans = make_read_spans(m6a_records, fp_records, region_start, region_end)
     read_order = select_read_order(read_spans, args.max_reads)
     if not read_order:
@@ -550,7 +711,6 @@ def main():
             writer.writerow([read_id, row["start"], row["end"], row["overlap_bp"], row["feature_count"]])
 
     ini_path = os.path.join(region_dir, f"{args.sample}.{region_name}.tracks.ini")
-    use_tad_boundaries = region_span < SMALL_REGION_TAD_THRESHOLD
     write_tracks_ini(
         ini_path,
         sample=args.sample,
@@ -560,9 +720,9 @@ def main():
         mc5_summary_track=args.mc5_summary_track,
         cpg_bed=auto_cpg_bed(args.sample),
         hic_depth=args.hic_depth,
-        tad_bed=TAD_BOUNDARY_BED if use_tad_boundaries else TAD_BED,
-        tad_title="TAD boundaries (ENCFF156ECM)" if use_tad_boundaries else "TADs (Arrowhead, GM12878)",
-        show_hic=not use_tad_boundaries,
+        tad_bed=boundary_lines_bed,
+        tad_title="TAD boundary lines (ENCFF156ECM)",
+        show_hic=True,
     )
 
     print(ini_path)

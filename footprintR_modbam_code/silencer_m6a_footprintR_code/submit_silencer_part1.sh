@@ -20,4 +20,9 @@ export OUTPUT_SCOPE="${OUTPUT_SCOPE:-sample_chr}"
 
 module load R/4.4.1
 
+if ! command -v Rscript >/dev/null 2>&1; then
+	echo "ERROR: Rscript not found after loading R/4.4.1. Check module environment." >&2
+	exit 127
+fi
+
 Rscript /project/spott/cshan/fiber-seq/code/footprintR_modbam_code/silencer_m6a_footprintR_code/silencer_modbam_summary_part1.R
