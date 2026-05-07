@@ -172,9 +172,10 @@ fire_version <- "v0.1"
 
 # Analysis options
 selected_chr <- c("chr1")  # can be multiple chromosomes
-tss_flank <- 10000
-min_dist <- 500
-max_dist <- 10000
+flanks <- c(1000, 500, 250)
+flank_labels <- c("1kb", "500bp", "250bp")
+# Pair distance filter is set per-flank inside the run loop:
+# min_dist = 100, max_dist = 2 * flank
 pseudocount <- 1
 ncore <- 4
 ```
@@ -262,17 +263,21 @@ make_gene_windows <- function(gene_annots_gr, gene_list, flank) {
   makeGRangesFromDataFrame(gene_windows.df, keep.extra.columns = TRUE)
 }
 
-run_coaccess_for_gene_list <- function(gene_list, label) {
-  label_dir <- file.path(out_dir, label)
+run_coaccess_for_gene_list <- function(gene_list, label, flank, flank_label) {
+  min_dist <- 100
+  max_dist <- 2 * flank
+  full_label <- paste0(label, "_", flank_label)
+  label_dir <- file.path(out_dir, full_label)
   dir.create(label_dir, showWarnings = FALSE, recursive = TRUE)
 
   for (chr in selected_chr) {
-    cat("\nRunning", label, "on", chr, "...\n")
+    cat("\nRunning", full_label, "on", chr,
+        "(flank =", flank, "bp, dist filter =", min_dist, "-", max_dist, "bp) ...\n")
 
     gene.annots.chr <- gene.annots[seqnames(gene.annots) == chr]
-    gene_windows.gr <- make_gene_windows(gene.annots.chr, gene_list, tss_flank)
+    gene_windows.gr <- make_gene_windows(gene.annots.chr, gene_list, flank)
     if (length(gene_windows.gr) == 0) {
-      cat("No gene windows for", label, "on", chr, "\n")
+      cat("No gene windows for", full_label, "on", chr, "\n")
       next
     }
 
@@ -293,7 +298,7 @@ run_coaccess_for_gene_list <- function(gene_list, label) {
 
     genes_with_multi_CREs <- genes_with_multi_CREs.df$gene_name[genes_with_multi_CREs.df$n_CRE > 1]
     if (length(genes_with_multi_CREs) == 0) {
-      cat("No multi-CRE genes for", label, "on", chr, "\n")
+      cat("No multi-CRE genes for", full_label, "on", chr, "\n")
       next
     }
 
@@ -314,7 +319,7 @@ run_coaccess_for_gene_list <- function(gene_list, label) {
     }, mc.cores = ncore)
 
     # Find co-accessible CREs in each gene window
-    coaccess_file <- file.path(label_dir, paste0(sample_name, "_", chr, "_", label, "_CREs_around_genes_coaccess_res.rds"))
+    coaccess_file <- file.path(label_dir, paste0(sample_name, "_", chr, "_", full_label, "_CREs_around_genes_coaccess_res.rds"))
 
     coaccess_res <- parallel::mclapply(genes_with_multi_CREs, function(x) {
       tmp_gene_window_CREs.gr <- gene_windows_CREs.gr[gene_windows_CREs.gr$gene_name == x]
@@ -422,7 +427,25 @@ run_coaccess_for_gene_list <- function(gene_list, label) {
       rownames(coaccess_stat_df) <- NULL
       saveRDS(
         coaccess_stat_df,
-        file = file.path(label_dir, paste0(sample_name, "_", chr, "_", label, "_CREs_around_genes_coaccess_stat_df.rds"))
+        file = file.path(label_dir, paste0(sample_name, "_", chr, "_", full_label, "_CREs_around_genes_coaccess_stat_df.rds"))
+      )
+
+      # Per-gene aggregate: mean log2(OR) across CRE pairs in the gene window
+      per_gene_df <- coaccess_stat_df |>
+        dplyr::mutate(log2OR = log2(OR)) |>
+        dplyr::filter(is.finite(log2OR)) |>
+        dplyr::group_by(gene_name) |>
+        dplyr::summarise(
+          n_pairs = dplyr::n(),
+          mean_log2OR = mean(log2OR),
+          median_log2OR = stats::median(log2OR),
+          mean_dist = mean(dist),
+          median_n_shared_reads = stats::median(n_shared_reads),
+          .groups = "drop"
+        )
+      saveRDS(
+        per_gene_df,
+        file = file.path(label_dir, paste0(sample_name, "_", chr, "_", full_label, "_CREs_around_genes_per_gene_df.rds"))
       )
     }
   }
@@ -432,6 +455,8 @@ run_coaccess_for_gene_list <- function(gene_list, label) {
 ## Run analysis
 
 ```{r run-analysis}
-run_coaccess_for_gene_list(high_genes, "high_pausing")
-run_coaccess_for_gene_list(low_genes, "low_pausing")
+for (i in seq_along(flanks)) {
+  run_coaccess_for_gene_list(high_genes, "high_pausing", flanks[i], flank_labels[i])
+  run_coaccess_for_gene_list(low_genes,  "low_pausing",  flanks[i], flank_labels[i])
+}
 ```

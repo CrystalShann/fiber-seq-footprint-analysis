@@ -2,10 +2,10 @@
 
 #SBATCH --job-name=merge_FIRE_nuc
 #SBATCH --account=pi-spott
-#SBATCH --partition=bigmem
+#SBATCH --partition=caslake
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=50G
+#SBATCH --mem=100G
 #SBATCH --time=12:00:00
 #SBATCH --output=/project/spott/cshan/fiber-seq/results/logs/merge_FIRE_nuc_%j.out
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/merge_FIRE_nuc_%j.err

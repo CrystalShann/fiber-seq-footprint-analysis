@@ -493,6 +493,7 @@ max_modified_hist_bin <- get_env_int("MAX_MODIFIED_HIST_BIN", 10L)
 tss_access_window     <- get_env_int("TSS_ACCESS_WINDOW",     100L)  # bp either side of TSS
 tss_source_filter     <- toupper(get_env_chr("TSS_SOURCE_FILTER", "ALL"))
 chroms_env            <- get_env_chr("CHROMS",                "AUTO")
+do_position_scan      <- get_env_int("DO_POSITION_SCAN",      1L) > 0L  # FALSE = skip m6A position scan and the 4 derived summary tables/plots; only the per-read accessibility table is produced. Use when re-running for a different TSS_ACCESS_WINDOW after the position-level outputs have already been written.
 
 polii_root   <- get_env_chr("POLII_ROOT", "/project/spott/cshan/fiber-seq/results/PolII")
 pausing_path <- get_env_chr(
@@ -556,6 +557,7 @@ data.table::fwrite(
   sep = "\t"
 )
 
+message(sprintf("TSS_ACCESS_WINDOW = +/- %d bp  |  DO_POSITION_SCAN = %s", tss_access_window, do_position_scan))
 message("Selected chromosomes: ", paste(chroms, collapse = ", "))
 for (grp in QUARTILE_LEVELS) {
   message(sprintf("  %-16s: %d genes", grp, nrow(pausing_groups[pausing_group == grp])))
@@ -578,8 +580,11 @@ all_gene_bin_summary <- list()
 all_meta             <- list()
 
 aligned_path <- file.path(table_dir, sprintf("%s_m6A_tss_aligned_positions.tsv.gz", sample_name))
-access_path  <- file.path(table_dir, sprintf("%s_tss_read_accessibility.tsv.gz",    sample_name))
-if (file.exists(aligned_path)) file.remove(aligned_path)
+access_path  <- file.path(
+  table_dir,
+  sprintf("%s_tss_read_accessibility_aw%dbp.tsv.gz", sample_name, tss_access_window)
+)
+if (do_position_scan && file.exists(aligned_path)) file.remove(aligned_path)
 if (file.exists(access_path))  file.remove(access_path)
 wrote_aligned <- FALSE
 wrote_access  <- FALSE
@@ -604,23 +609,25 @@ for (chrom in chroms) {
     chunk_windows <- promoter_windows[from:to]
     chunk_meta    <- promoter_meta[from:to]
 
-    # ── Summary-level m6A across the full promoter window ─────────────────
-    chunk_positions <- read_modbam_summary_positions(
-      bamfiles         = bamfiles,
-      sample_name      = sample_name,
-      promoter_windows = chunk_windows,
-      modbase_code     = "a",
-      seqinfo          = bam_seqinfo,
-      bpparam          = bpparam_serial,
-      modProbThreshold = mod_prob_threshold
-    )
-    chunk_aligned <- align_positions_to_tss(
-      position_dt      = chunk_positions,
-      promoter_windows = chunk_windows,
-      promoter_meta    = chunk_meta
-    )
-    chrom_aligned[[i]] <- chunk_aligned
-    wrote_aligned <- append_tsv(chunk_aligned, aligned_path, wrote_aligned)
+    if (do_position_scan) {
+      # ── Summary-level m6A across the full promoter window ───────────────
+      chunk_positions <- read_modbam_summary_positions(
+        bamfiles         = bamfiles,
+        sample_name      = sample_name,
+        promoter_windows = chunk_windows,
+        modbase_code     = "a",
+        seqinfo          = bam_seqinfo,
+        bpparam          = bpparam_serial,
+        modProbThreshold = mod_prob_threshold
+      )
+      chunk_aligned <- align_positions_to_tss(
+        position_dt      = chunk_positions,
+        promoter_windows = chunk_windows,
+        promoter_meta    = chunk_meta
+      )
+      chrom_aligned[[i]] <- chunk_aligned
+      wrote_aligned <- append_tsv(chunk_aligned, aligned_path, wrote_aligned)
+    }
 
     # ── Per-read accessibility in a small TSS-centred window ──────────────
     # Build GRanges for ±tss_access_window around each TSS in this chunk.
@@ -658,72 +665,81 @@ for (chrom in chroms) {
       wrote_access <- append_tsv(chunk_access, access_path, wrote_access)
     }
 
-    rm(chunk_positions, chunk_aligned, chunk_access)
+    if (exists("chunk_positions")) rm(chunk_positions)
+    if (exists("chunk_aligned"))   rm(chunk_aligned)
+    rm(chunk_access)
     gc()
   }
 
-  chrom_aligned_dt <- data.table::rbindlist(chrom_aligned, use.names = TRUE, fill = TRUE)
-  all_gene_summary[[chrom]]     <- summarize_gene_m6a(chrom_aligned_dt, chrom_groups)
-  all_gene_bin_summary[[chrom]] <- summarize_gene_bin_m6a(chrom_aligned_dt, chrom_groups, window_bp, bin_size)
-  all_meta[[chrom]]             <- summarize_group_meta(chrom_aligned_dt, chrom_groups, window_bp, bin_size)
+  if (do_position_scan) {
+    chrom_aligned_dt <- data.table::rbindlist(chrom_aligned, use.names = TRUE, fill = TRUE)
+    all_gene_summary[[chrom]]     <- summarize_gene_m6a(chrom_aligned_dt, chrom_groups)
+    all_gene_bin_summary[[chrom]] <- summarize_gene_bin_m6a(chrom_aligned_dt, chrom_groups, window_bp, bin_size)
+    all_meta[[chrom]]             <- summarize_group_meta(chrom_aligned_dt, chrom_groups, window_bp, bin_size)
+  }
 }
 
 
 # ── Aggregate and write ────────────────────────────────────────────────────────
 
-gene_summary     <- data.table::rbindlist(all_gene_summary,     use.names = TRUE, fill = TRUE)
-gene_bin_summary <- data.table::rbindlist(all_gene_bin_summary, use.names = TRUE, fill = TRUE)
-gene_bin_hist    <- summarize_gene_bin_histogram(gene_bin_summary, max_modified_hist_bin)
-group_meta_raw   <- data.table::rbindlist(all_meta,             use.names = TRUE, fill = TRUE)
+if (do_position_scan) {
+  gene_summary     <- data.table::rbindlist(all_gene_summary,     use.names = TRUE, fill = TRUE)
+  gene_bin_summary <- data.table::rbindlist(all_gene_bin_summary, use.names = TRUE, fill = TRUE)
+  gene_bin_hist    <- summarize_gene_bin_histogram(gene_bin_summary, max_modified_hist_bin)
+  group_meta_raw   <- data.table::rbindlist(all_meta,             use.names = TRUE, fill = TRUE)
 
-group_n_tss <- gene_summary[, .(n_tss = data.table::uniqueN(tss_uid)), by = pausing_group]
-group_meta  <- group_meta_raw[, .(modified_calls = sum(modified_calls),
-                                   total_calls    = sum(total_calls)),
-                               by = .(pausing_group, bin)]
-group_meta  <- merge(group_meta, group_n_tss, by = "pausing_group", all.x = TRUE)
-group_meta[, fraction_modified      := data.table::fifelse(total_calls > 0, modified_calls / total_calls, NA_real_)]
-group_meta[, modified_calls_per_tss := data.table::fifelse(n_tss > 0, modified_calls / n_tss, NA_real_)]
+  group_n_tss <- gene_summary[, .(n_tss = data.table::uniqueN(tss_uid)), by = pausing_group]
+  group_meta  <- group_meta_raw[, .(modified_calls = sum(modified_calls),
+                                     total_calls    = sum(total_calls)),
+                                 by = .(pausing_group, bin)]
+  group_meta  <- merge(group_meta, group_n_tss, by = "pausing_group", all.x = TRUE)
+  group_meta[, fraction_modified      := data.table::fifelse(total_calls > 0, modified_calls / total_calls, NA_real_)]
+  group_meta[, modified_calls_per_tss := data.table::fifelse(n_tss > 0, modified_calls / n_tss, NA_real_)]
 
-pfx  <- function(s) file.path(table_dir, sprintf("%s_%s", sample_name, s))
-ppfx <- function(s) file.path(plot_dir,  sprintf("%s_%s", sample_name, s))
+  pfx  <- function(s) file.path(table_dir, sprintf("%s_%s", sample_name, s))
+  ppfx <- function(s) file.path(plot_dir,  sprintf("%s_%s", sample_name, s))
 
-gene_summary_path     <- pfx("gene_m6A_summary_quartiles.tsv")
-gene_bin_summary_path <- pfx("gene_bin_m6A_summary_quartiles.tsv.gz")
-histogram_table_path  <- pfx("gene_bin_m6A_histogram_quartiles.tsv")
-meta_path             <- pfx("m6A_metaprofile_quartiles.tsv")
-group_summary_path    <- pfx("m6A_group_summary_quartiles.tsv")
+  gene_summary_path     <- pfx("gene_m6A_summary_quartiles.tsv")
+  gene_bin_summary_path <- pfx("gene_bin_m6A_summary_quartiles.tsv.gz")
+  histogram_table_path  <- pfx("gene_bin_m6A_histogram_quartiles.tsv")
+  meta_path             <- pfx("m6A_metaprofile_quartiles.tsv")
+  group_summary_path    <- pfx("m6A_group_summary_quartiles.tsv")
 
-data.table::fwrite(gene_summary,                                                  gene_summary_path,     sep = "\t")
-data.table::fwrite(gene_bin_summary[order(pausing_group, gene_id_base, bin)],     gene_bin_summary_path, sep = "\t")
-data.table::fwrite(gene_bin_hist[order(pausing_group, bin, modified_call_bin)],   histogram_table_path,  sep = "\t")
-data.table::fwrite(group_meta[order(pausing_group, bin)],                         meta_path,             sep = "\t")
+  data.table::fwrite(gene_summary,                                                  gene_summary_path,     sep = "\t")
+  data.table::fwrite(gene_bin_summary[order(pausing_group, gene_id_base, bin)],     gene_bin_summary_path, sep = "\t")
+  data.table::fwrite(gene_bin_hist[order(pausing_group, bin, modified_call_bin)],   histogram_table_path,  sep = "\t")
+  data.table::fwrite(group_meta[order(pausing_group, bin)],                         meta_path,             sep = "\t")
 
-group_summary <- gene_summary[, .(
-  n_genes             = data.table::uniqueN(gene_id_base),
-  n_tss               = data.table::uniqueN(tss_uid),
-  median_PI           = stats::median(PI, na.rm = TRUE),
-  mean_m6A_fraction   = mean(m6A_fraction_modified, na.rm = TRUE),
-  median_m6A_fraction = stats::median(m6A_fraction_modified, na.rm = TRUE),
-  mean_total_calls    = mean(m6A_total_calls, na.rm = TRUE),
-  median_total_calls  = as.numeric(stats::median(m6A_total_calls, na.rm = TRUE))
-), by = pausing_group]
-data.table::fwrite(group_summary, group_summary_path, sep = "\t")
+  group_summary <- gene_summary[, .(
+    n_genes             = data.table::uniqueN(gene_id_base),
+    n_tss               = data.table::uniqueN(tss_uid),
+    median_PI           = stats::median(PI, na.rm = TRUE),
+    mean_m6A_fraction   = mean(m6A_fraction_modified, na.rm = TRUE),
+    median_m6A_fraction = stats::median(m6A_fraction_modified, na.rm = TRUE),
+    mean_total_calls    = mean(m6A_total_calls, na.rm = TRUE),
+    median_total_calls  = as.numeric(stats::median(m6A_total_calls, na.rm = TRUE))
+  ), by = pausing_group]
+  data.table::fwrite(group_summary, group_summary_path, sep = "\t")
 
-meta_plot_path      <- ppfx("m6A_metaprofile_quartiles.pdf")
-boxplot_path        <- ppfx("gene_m6A_fraction_boxplot_quartiles.pdf")
-histogram_plot_path <- ppfx("gene_bin_m6A_histogram_quartiles.pdf")
+  meta_plot_path      <- ppfx("m6A_metaprofile_quartiles.pdf")
+  boxplot_path        <- ppfx("gene_m6A_fraction_boxplot_quartiles.pdf")
+  histogram_plot_path <- ppfx("gene_bin_m6A_histogram_quartiles.pdf")
 
-plot_m6a_quartile_meta(group_meta,     meta_plot_path,      sample_name, window_bp)
-plot_gene_m6a_boxplot_quartiles(gene_summary, boxplot_path,  sample_name)
-plot_gene_bin_histogram_quartiles(gene_bin_hist, histogram_plot_path, sample_name, window_bp)
+  plot_m6a_quartile_meta(group_meta,     meta_plot_path,      sample_name, window_bp)
+  plot_gene_m6a_boxplot_quartiles(gene_summary, boxplot_path,  sample_name)
+  plot_gene_bin_histogram_quartiles(gene_bin_hist, histogram_plot_path, sample_name, window_bp)
 
-message("Wrote gene summary:        ", gene_summary_path)
-message("Wrote gene-bin summary:    ", gene_bin_summary_path)
-message("Wrote histogram table:     ", histogram_table_path)
-message("Wrote metaprofile table:   ", meta_path)
-message("Wrote group summary:       ", group_summary_path)
-message("Wrote aligned positions:   ", aligned_path)
+  message("Wrote gene summary:        ", gene_summary_path)
+  message("Wrote gene-bin summary:    ", gene_bin_summary_path)
+  message("Wrote histogram table:     ", histogram_table_path)
+  message("Wrote metaprofile table:   ", meta_path)
+  message("Wrote group summary:       ", group_summary_path)
+  message("Wrote aligned positions:   ", aligned_path)
+  message("Wrote metaprofile plot:    ", meta_plot_path)
+  message("Wrote boxplot:             ", boxplot_path)
+  message("Wrote histogram plot:      ", histogram_plot_path)
+} else {
+  message("DO_POSITION_SCAN=0 -> skipped m6A position scan and the position-level summary tables/plots.")
+}
+
 message("Wrote read accessibility:  ", access_path)
-message("Wrote metaprofile plot:    ", meta_plot_path)
-message("Wrote boxplot:             ", boxplot_path)
-message("Wrote histogram plot:      ", histogram_plot_path)

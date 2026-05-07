@@ -13,7 +13,7 @@ out_dir=$6
 
 fire_version="v0.1"
 
-module load python/anaconda-2022.05
+module load python/miniforge-25.3.0
 
 if [[ $region =~ ^(chr[0-9XYM]+):([0-9]+)-([0-9]+)$ ]]; then
     chrom="${BASH_REMATCH[1]}"
@@ -44,12 +44,12 @@ region_bam="$out_dir/$plot_name/region.bam"
 samtools view -b "$bam_file" "$region" > "$region_bam"
 
 echo "Computing FIRE over input BAM file..."
-source activate /scratch/midway3/kaixuan/conda/envs/fibertools
+source activate /project/spott/cshan/envs/fire-env
 region_fire_bed="$out_dir/$plot_name/parsed/fire.bed"
 ft add-nucleosomes "$region_bam" | ft fire --min-msp 10 --min-ave-msp-size 10 --skip-no-m6a - | ft fire --extract - > "$region_fire_bed"
 
 echo "Filtering FIRE elements to the region of interest..."
-source activate /scratch/midway3/kaixuan/conda/envs/fiberseq
+source activate /project/spott/cshan/envs/fire-env
 subset_fire_bed="$out_dir/$plot_name/parsed/subset_FIRE.bed"
 fire_elements_bed="$fire_dir/additional-outputs-$fire_version/fire-peaks/$fire_name-$fire_version-fire-elements.bed.gz"
 bedtools intersect -a "$fire_elements_bed" -b "$region_bed" -wa > "$subset_fire_bed"

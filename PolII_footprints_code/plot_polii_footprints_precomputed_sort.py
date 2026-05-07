@@ -95,6 +95,8 @@ TRACK_LABELS = {
     "140-160": "140-160 bp (nucleosome)",
 }
 N_BINS = 500
+NUCLEOSOME_SORT_CLASSES = {"FIRE_nucleosome", "nucleosome (140-160)"}
+DEFAULT_FIRE_NUC_LENGTH_RANGE = (140, 160)
 
 FIRE_NUC_BW_DIR = "/project/spott/cshan/fiber-seq/FIRE_nuc_by_chr_combined_sample/bigwig_files"
 
@@ -464,12 +466,110 @@ def fetch_bw(bw_path, chrom, start, end, n_bins=N_BINS):
         return np.linspace(start, end, n_bins), np.zeros(n_bins)
 
 
-def _footprint_order_key(footprints, sort_cls, tss_pos, plot_mode="midpoint"):
-    """Sort reads by selected class midpoint or edge closest to the TSS.
+def _parse_length_range(length_range):
+    """Normalize length range input to (min_len, max_len), or None."""
+    if length_range is None:
+        return None
+    if isinstance(length_range, str):
+        value = length_range.strip().lower()
+        if value in {"", "none", "off", "false"}:
+            return None
+        if "-" not in value:
+            raise ValueError("Length range must be formatted as 'MIN-MAX', e.g. '140-160'.")
+        min_len, max_len = value.split("-", 1)
+        length_range = (int(min_len), int(max_len))
+    if len(length_range) != 2:
+        raise ValueError("Length range must contain exactly two values: min and max.")
+    min_len, max_len = int(length_range[0]), int(length_range[1])
+    if min_len < 0 or max_len < min_len:
+        raise ValueError("Length range must satisfy 0 <= min <= max.")
+    return min_len, max_len
+
+
+def _filter_fire_nucleosome_by_length(reads, length_range):
+    """Drop FIRE_nucleosome footprints outside the requested length range."""
+    length_range = _parse_length_range(length_range)
+    if length_range is None:
+        return reads
+
+    min_len, max_len = length_range
+    filtered_reads = defaultdict(list)
+    for read_name, footprints in reads.items():
+        for fp_start, fp_end, cls, color in footprints:
+            if cls == "FIRE_nucleosome":
+                fp_len = fp_end - fp_start
+                if fp_len < min_len or fp_len > max_len:
+                    continue
+            filtered_reads[read_name].append((fp_start, fp_end, cls, color))
+    return filtered_reads
+
+
+def _relative_to_tss(pos, tss_pos, strand):
+    """Return strand-aware TSS-relative position."""
+    if strand == "+":
+        return pos - tss_pos
+    if strand == "-":
+        return tss_pos - pos
+    raise ValueError("strand must be '+' or '-'.")
+
+
+def _relative_interval_to_tss(fp_start, fp_end, tss_pos, strand):
+    """Return a footprint interval in strand-aware TSS-relative coordinates."""
+    if strand == "+":
+        return fp_start - tss_pos, fp_end - tss_pos
+    if strand == "-":
+        return tss_pos - fp_end, tss_pos - fp_start
+    raise ValueError("strand must be '+' or '-'.")
+
+
+def _nucleosome_distance_order_key(footprints, sort_cls, tss_pos, strand):
+    """Sort by the TSS-spanning gap between -1 and +1 nucleosome edges."""
+    if sort_cls in NUCLEOSOME_SORT_CLASSES:
+        sort_classes = {sort_cls}
+    else:
+        sort_classes = NUCLEOSOME_SORT_CLASSES
+
+    upstream = []
+    downstream = []
+    for fp_start, fp_end, cls, _ in footprints:
+        if cls not in sort_classes:
+            continue
+        rel_start, rel_end = _relative_interval_to_tss(
+            fp_start,
+            fp_end,
+            tss_pos,
+            strand,
+        )
+        if rel_end <= 0:
+            upstream.append(rel_end)
+        elif rel_start >= 0:
+            downstream.append(rel_start)
+
+    if not upstream or not downstream:
+        return (float("inf"), float("inf"), float("inf"))
+
+    minus1_tss_edge = max(upstream)
+    plus1_tss_edge = min(downstream)
+    gap = plus1_tss_edge - minus1_tss_edge
+    return (gap, plus1_tss_edge, abs(minus1_tss_edge))
+
+
+def _footprint_order_key(
+    footprints,
+    sort_cls,
+    tss_pos,
+    plot_mode="midpoint",
+    strand="+",
+    sort_mode="nearest",
+):
+    """Sort reads by selected class midpoint/edge relative to the TSS.
 
     Uses footprints of sort_cls only unless sort_cls='all'; reads with no matching
     footprint sort last.
     """
+    if sort_mode == "nucleosome_distance":
+        return _nucleosome_distance_order_key(footprints, sort_cls, tss_pos, strand)
+
     candidates = []
     for fp_start, fp_end, cls, _ in footprints:
         if sort_cls != "all" and cls != sort_cls:
@@ -478,13 +578,21 @@ def _footprint_order_key(footprints, sort_cls, tss_pos, plot_mode="midpoint"):
             anchor = (fp_start + fp_end) / 2
             dist = abs(anchor - tss_pos)
         elif plot_mode == "edge":
-            start_dist = abs(fp_start - tss_pos)
-            end_dist = abs(fp_end - tss_pos)
-            dist = min(start_dist, end_dist)
-            anchor = fp_start if start_dist <= end_dist else fp_end
+            anchor = fp_end if strand == "+" else fp_start
+            dist = abs(anchor - tss_pos)
         else:
             raise ValueError("plot_mode must be 'midpoint' or 'edge'.")
-        candidates.append((dist, anchor))
+
+        if sort_mode == "nearest":
+            candidates.append((dist, anchor))
+        elif sort_mode == "plus1":
+            anchor_rel = _relative_to_tss(anchor, tss_pos, strand)
+            if anchor_rel > 0:
+                candidates.append((anchor_rel, anchor))
+        else:
+            raise ValueError(
+                "sort_mode must be 'nearest', 'plus1', or 'nucleosome_distance'."
+            )
     if candidates:
         return min(candidates)
     return (float("inf"), min(fp[0] for fp in footprints))
@@ -505,6 +613,8 @@ def plot_gene_footprints(
     use_precomputed_summaries=True,
     fp_class="FIRE_nucleosome",
     plot_mode="midpoint",
+    sort_mode="nearest",
+    fire_nuc_length_range=DEFAULT_FIRE_NUC_LENGTH_RANGE,
     fp_bed_dir=DEFAULT_FP_BED_DIR,
     save_pdf=False,
 ):
@@ -532,12 +642,18 @@ def plot_gene_footprints(
         fp_class = _normalize_fp_class(fp_class)
         print(f"Class  : {fp_class}")
         print(f"Mode   : {plot_mode}")
+        print(f"Sort   : {sort_mode}")
+        print(f"FIRE nuc length: {_parse_length_range(fire_nuc_length_range)}")
 
     if not (0 < min_window_span_fraction <= 1):
         raise ValueError("min_window_span_fraction must be in the interval (0, 1].")
 
     if plot_mode not in {"midpoint", "edge"}:
         raise ValueError("plot_mode must be 'midpoint' or 'edge'.")
+    if sort_mode not in {"nearest", "plus1", "nucleosome_distance"}:
+        raise ValueError(
+            "sort_mode must be 'nearest', 'plus1', or 'nucleosome_distance'."
+        )
 
     if use_precomputed_summaries:
         read_spans = collect_reads_from_indexed_beds(
@@ -557,6 +673,11 @@ def plot_gene_footprints(
     else:
         reads = collect_reads(locus_chrom, view_start, view_end, show_fire_nuc=show_fire_nuc)
         read_spans = reads
+    read_spans = _filter_fire_nucleosome_by_length(read_spans, fire_nuc_length_range)
+    if reads is read_spans:
+        reads = read_spans
+    else:
+        reads = _filter_fire_nucleosome_by_length(reads, fire_nuc_length_range)
     print(list(reads.items())[:5])
 
     span_margin = int(round(window_size * (1 - min_window_span_fraction)))
@@ -577,7 +698,14 @@ def plot_gene_footprints(
     )
     read_list = sorted(
         span_filtered_reads.items(),
-        key=lambda kv: _footprint_order_key(kv[1], sort_cls, locus_center, plot_mode),
+        key=lambda kv: _footprint_order_key(
+            kv[1],
+            sort_cls,
+            locus_center,
+            plot_mode,
+            strand=locus_strand,
+            sort_mode=sort_mode,
+        ),
     )
     read_list = read_list[:max_reads]
 
@@ -695,7 +823,7 @@ def plot_gene_footprints(
         os.makedirs(out_dir, exist_ok=True)
         if use_precomputed_summaries:
             class_tag = CLASS_SUBDIRS.get(fp_class, "all")
-            out_base = f"{out_dir}/{gene_name}_{class_tag}_{plot_mode}_footprints"
+            out_base = f"{out_dir}/{gene_name}_{class_tag}_{plot_mode}_{sort_mode}_footprints"
         else:
             out_base = f"{out_dir}/{gene_name}_footprints"
         plt.savefig(out_base + ".pdf", bbox_inches="tight")
@@ -793,8 +921,30 @@ def build_argparser():
         choices=["midpoint", "edge"],
         default="midpoint",
         help=(
-            "Sort selected reads by the selected class footprint midpoint or nearest edge "
-            "relative to the TSS (default: midpoint)."
+            "Sort selected reads by the selected class footprint midpoint or "
+            "strand-specific edge relative to the TSS. For edge mode, use the right "
+            "edge on + strand genes and the left edge on - strand genes "
+            "(default: midpoint)."
+        ),
+    )
+    p.add_argument(
+        "--sort-mode",
+        choices=["nearest", "plus1", "nucleosome_distance"],
+        default="nearest",
+        help=(
+            "Sort selected reads by the nearest selected-class footprint on either side "
+            "of the TSS, or by the nearest downstream/+1 selected-class footprint only "
+            "using strand-aware TSS-relative coordinates, or by the distance between "
+            "the selected-class -1 and +1 nucleosome edges across the TSS "
+            "(default: nearest)."
+        ),
+    )
+    p.add_argument(
+        "--fire-nuc-length-range",
+        default="140-160",
+        help=(
+            "Keep FIRE_nucleosome footprints only within this length range, formatted "
+            "as MIN-MAX bp. Use 'none' to disable this filter (default: 140-160)."
         ),
     )
     p.add_argument(
@@ -830,6 +980,8 @@ def main(argv=None):
         use_precomputed_summaries=not args.use_tabix_beds,
         fp_class=args.fp_class,
         plot_mode=args.plot_mode,
+        sort_mode=args.sort_mode,
+        fire_nuc_length_range=args.fire_nuc_length_range,
         fp_bed_dir=args.fp_bed_dir,
         save_pdf=args.save_pdf,
     )
